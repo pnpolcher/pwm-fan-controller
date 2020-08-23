@@ -20,29 +20,40 @@
 #define TMP_MAX_SAMPLES     16
 #define TMP_1_REG           0x00
 #define TMP_2_REG           0x01
-#define TMP_1_RAW_REG       0x02
-#define TMP_2_RAW_REG       0x03
-#define WRSET_STATUS_REG    0x04
+#define WRSET_STATUS_REG    0x02
 
-#define TEMP_LUT_SIZE   101
+#define TEMP_LUT_SIZE       101
 
 #define CMD_READ_REGISTER   0x01
 #define CMD_WRITE_REGISTER  0x81
 #define CMD_READ_SETTING    0x02
 #define CMD_WRITE_SETTING   0x82
 
+#define SETTINGS_SETPOINT   0x00
+#define SETTINGS_KP         0x01
+#define SETTINGS_KI         0x02
+#define SETTINGS_KD         0x03
+
 #define FSM_IDLE            0x00
 #define FSM_CMD_SETUP       0x01
 #define FSM_CMD_REG         0x02
 #define FSM_CMD_ARG         0x03
-#define FSM_CMD_ARMED       0x04
+#define FSM_CMD_ARG_2       0x04
+#define FSM_CMD_ARMED       0x05
+#define FSM_CMD_RESPONSE    0x06
+
+#define MIN_OUTPUT          0
+#define MAX_OUTPUT          2 << 9  // 10-bit precision
 
 typedef unsigned char byte;
 
 volatile byte command = 0;
 volatile byte cmd_reg = 0;
-volatile byte cmd_arg = 0;
-volatile byte register_map[16] = {0,};
+volatile byte cmd_arg[2] = {0,};
+volatile byte i2c_bytes_left = 0;
+volatile byte i2c_result_buffer[2] = {0,};
+
+volatile byte register_map[4] = {0,};
 volatile byte i2c_byte_count = 0;
 
 volatile unsigned short adc_tmp_1 = 0;
@@ -54,9 +65,24 @@ volatile unsigned short row_buffer[16];
 
 volatile byte fsm_state = FSM_IDLE;
 
-const unsigned short pref_addrs[2] = {
+/*
+ * PID parameters.
+ */
+unsigned short kp;
+unsigned short ki;
+unsigned short kd;
+
+unsigned short setpoint;
+
+unsigned short last_input[2];
+unsigned short d_input[2];
+
+
+const unsigned short pref_addrs[4] = {
     0x780,
-    0x782
+    0x782,
+    0x784,
+    0x786
 };
 
 const unsigned short temp_lut[TEMP_LUT_SIZE] = {
@@ -66,10 +92,10 @@ const unsigned short temp_lut[TEMP_LUT_SIZE] = {
     785, 776, 768, 759, 750, 741, 731, 721, 712, 701, // 30..39
     691, 681, 670, 659, 648, 637, 625, 614, 602, 590, // 40..49
     579, 567, 554, 542, 530, 518, 505, 493, 481, 468, // 50..59
-    456, 444, 432, 420, 407, 395, 384, 372, 360, 349,
-    337, 326, 315, 304, 294, 283, 273, 263, 253, 244,
-    235, 225, 217, 208, 200, 191, 183, 176, 168, 161,
-    154, 147, 141, 135, 129, 123, 117, 112, 106, 101,
+    456, 444, 432, 420, 407, 395, 384, 372, 360, 349, // 60..69
+    337, 326, 315, 304, 294, 283, 273, 263, 253, 244, // 70..79
+    235, 225, 217, 208, 200, 191, 183, 176, 168, 161, // 80..89
+    154, 147, 141, 135, 129, 123, 117, 112, 106, 101, // 90..99
     96
 };
 
@@ -99,7 +125,7 @@ short get_temp(unsigned short code)
     return right;
 }
 
-int eeprom_read(unsigned short addr)
+unsigned short eeprom_read(unsigned short addr)
 {
     byte gie_status = INTCONbits.GIE;
     INTCONbits.GIE = 0;
@@ -177,7 +203,7 @@ void eeprom_write(unsigned short addr)
     INTCONbits.GIE = gie_status;
 }
 
-void write_preference(byte preference, byte data)
+void write_preference(byte preference, unsigned short data)
 {
     unsigned short addr = 0x780;
     register_map[WRSET_STATUS_REG] = 0x00;
@@ -191,182 +217,257 @@ void write_preference(byte preference, byte data)
     }
     
     eeprom_erase(0x780);
-    row_buffer[preference] = (unsigned short)data;
+    row_buffer[preference] = data;
     eeprom_write(0x780);
     register_map[WRSET_STATUS_REG] = 0xaa;
     INTCONbits.GIE = 1;
 }
 
-byte process_command()
+void process_command()
 {
-    byte result;
+    unsigned short data;
     
     switch (command)
     {
         case CMD_READ_REGISTER:
-            result = register_map[cmd_reg % sizeof(register_map)];
+            i2c_result_buffer[0] =
+                    register_map[cmd_reg % sizeof(register_map)];
+            i2c_bytes_left = 1;
             break;
             
         case CMD_WRITE_REGISTER:
-            register_map[cmd_reg % sizeof(register_map)] = cmd_arg;
+            register_map[cmd_reg % sizeof(register_map)] = cmd_arg[0];
+            i2c_bytes_left = 0;
             break;
             
         case CMD_READ_SETTING:
-            result = eeprom_read(pref_addrs[cmd_reg % sizeof(pref_addrs)]);
+            //*word_result =
+            data =
+                    eeprom_read(pref_addrs[cmd_reg % sizeof(pref_addrs)]);
+            i2c_result_buffer[0] = data & 0xff;
+            i2c_result_buffer[1] = (data & 0xff00) >> 8;
+            i2c_bytes_left = 2;
             break;
             
         case CMD_WRITE_SETTING:
-            write_preference(cmd_reg % sizeof(pref_addrs), cmd_arg);
-            result = 0xc0;
+            data = (cmd_arg[0] << 8) | cmd_arg[1];
+            write_preference(cmd_reg % sizeof(pref_addrs), data);
+            i2c_bytes_left = 0;
             break;
             
         default:
-            result = 0xfe;
+            i2c_bytes_left = 0;
             break;
     }
     
     fsm_state = FSM_IDLE;
+}
+
+void mssp_isr(void)
+{
+    byte b;
     
-    return result;
+    SSPCONbits.CKP = 0;
+
+    // If there was an overflow or a write collision.
+    if ((SSPCONbits.SSPOV) || (SSPCONbits.WCOL))
+    {
+        b = SSP1BUF;
+        SSPCONbits.SSPOV = 0;
+        SSPCONbits.WCOL = 0;
+        SSPCONbits.CKP = 1;
+    }
+
+    // If the received byte is the I2C address.
+    if (!SSP1STATbits.D_nA)
+    {
+        i2c_byte_count = 0;
+
+        // Discard slave address.
+        b = SSP1BUF;
+
+        // If the master wants to read.
+        if (SSP1STATbits.R_nW)
+        {
+            if (fsm_state == FSM_CMD_ARMED)
+            {
+                process_command();
+            }
+            
+            if (i2c_bytes_left > 0)
+            {
+                SSP1BUF = i2c_result_buffer[i2c_bytes_left-1];
+                i2c_bytes_left--;
+            }
+        }
+    }
+    else // Data bytes are being send/requested by the master.
+    {
+        // Increment bytes processed count.
+        i2c_byte_count++;
+
+        if (i2c_byte_count == 1)
+        {
+            fsm_state = FSM_CMD_SETUP;
+        }
+
+        // Reset BF.
+        b = SSP1BUF;
+
+        // Master wants to read data.
+        if (SSP1STATbits.R_nW)
+        {
+            // Load the data (to send to the master) into the transmit
+            // buffer.
+            if (fsm_state == FSM_CMD_ARMED)
+            {
+                process_command();
+            }
+            
+            if (i2c_bytes_left > 0)
+            {
+                SSP1BUF = i2c_result_buffer[i2c_bytes_left-1];
+                i2c_bytes_left--;
+            }
+        }
+        else
+        {
+            switch (fsm_state)
+            {
+                case FSM_CMD_SETUP:
+                    fsm_state = FSM_CMD_REG;
+                    command = b;
+                    break;
+
+                case FSM_CMD_REG:
+                    cmd_reg = b;
+                    fsm_state = FSM_CMD_ARG;
+                    break;
+
+                case FSM_CMD_ARG:
+                    cmd_arg[0] = b;
+                    fsm_state = FSM_CMD_ARG_2;
+                    break;
+                    
+                case FSM_CMD_ARG_2:
+                    cmd_arg[1] = b;
+                    fsm_state = FSM_CMD_ARMED;
+                    if ((command & 0x80) == 0x80)
+                    {
+                        process_command();
+                    }
+                    break;
+
+                default:
+                    fsm_state = FSM_IDLE;
+                    break;
+            }
+        }
+    }
+
+    // Clear interrupt flag.
+    PIR1bits.SSP1IF = 0;
+
+    // Release the clock (clock stretch, SEN, enabled).
+    SSPCONbits.CKP = 1;
+}
+
+void adc_isr(void)
+{
+    if (ADCON0bits.CHS == 0b00110)
+    {
+        if (tmp_1_cnt == TMP_MAX_SAMPLES)
+        {
+            unsigned short code = (adc_tmp_1 / TMP_MAX_SAMPLES);
+            register_map[TMP_1_REG] = get_temp(code);
+            adc_tmp_1 = 0;
+            tmp_1_cnt = 0;
+        }
+        else
+        {
+            adc_tmp_1 += ((ADRESH & 0x03) << 8) + ADRESL;
+            tmp_1_cnt++;
+        }
+
+        // Switch to RA4/AN3.
+        ADCON0bits.CHS = 0b00011;
+    }
+    else
+    {
+        if (tmp_2_cnt == TMP_MAX_SAMPLES)
+        {
+            unsigned short code = (adc_tmp_2 / TMP_MAX_SAMPLES);
+            register_map[TMP_2_REG] = get_temp(code);
+            adc_tmp_2 = 0;
+            tmp_2_cnt = 0;
+        }
+        else
+        {
+            adc_tmp_2 += ((ADRESH & 0x03) << 8) + ADRESL;
+            tmp_2_cnt++;
+        }
+
+        // Switch to RC2/AN6.
+        ADCON0bits.CHS = 0b00110;
+    }
+
+    PIR1bits.ADIF = 0;
 }
 
 void __interrupt() isr(void)
 {
-    byte b;
-    
     if (PIR1bits.SSP1IF == 1)
     {
-        SSPCONbits.CKP = 0;
-        
-        // If there was an overflow or a write collision.
-        if ((SSPCONbits.SSPOV) || (SSPCONbits.WCOL))
-        {
-            b = SSP1BUF;
-            SSPCONbits.SSPOV = 0;
-            SSPCONbits.WCOL = 0;
-            SSPCONbits.CKP = 1;
-        }
-        
-        // If the received byte is the I2C address.
-        if (!SSP1STATbits.D_nA)
-        {
-            i2c_byte_count = 0;
-            
-            // Discard slave address.
-            b = SSP1BUF;
-            
-            // If the master wants to read.
-            if (SSP1STATbits.R_nW)
-            {
-                if (fsm_state == FSM_CMD_ARMED)
-                {
-                    SSP1BUF = process_command();
-                }
-            }
-        }
-        else // Data bytes are being send/requested by the master.
-        {
-            // Increment bytes processed count.
-            i2c_byte_count++;
-            
-            if (i2c_byte_count == 1)
-            {
-                fsm_state = FSM_CMD_SETUP;
-            }
-            
-            // Reset BF.
-            b = SSP1BUF;
-            
-            // Master wants to read data.
-            if (SSP1STATbits.R_nW)
-            {
-                // Load the data (to send to the master) into the transmit
-                // buffer.
-                if (fsm_state == FSM_CMD_ARMED)
-                {
-                    SSP1BUF = process_command();
-                }
-            }
-            else
-            {
-                switch (fsm_state)
-                {
-                    case FSM_CMD_SETUP:
-                        fsm_state = FSM_CMD_REG;
-                        command = b;
-                        break;
-                        
-                    case FSM_CMD_REG:
-                        cmd_reg = b;
-                        fsm_state = FSM_CMD_ARG;
-                        break;
-                        
-                    case FSM_CMD_ARG:
-                        cmd_arg = b;
-                        fsm_state = FSM_CMD_ARMED;
-                        if ((command & 0x80) == 0x80)
-                        {
-                            process_command();
-                        }
-                        
-                        break;
-                        
-                    default:
-                        fsm_state = FSM_IDLE;
-                        break;
-                }
-            }
-        }
-        
-        // Clear interrupt flag.
-        PIR1bits.SSP1IF = 0;
-        
-        // Release the clock (clock stretch, SEN, enabled).
-        SSPCONbits.CKP = 1;
+        mssp_isr();
     }
     
     if (PIR1bits.ADIF == 1)
     {
-        
-        if (ADCON0bits.CHS == 0b00110)
-        {
-            if (tmp_1_cnt == TMP_MAX_SAMPLES)
-            {
-                unsigned short code = (adc_tmp_1 / TMP_MAX_SAMPLES);
-                register_map[TMP_1_REG] = get_temp(code);
-                register_map[TMP_1_RAW_REG] = (byte)(code >> 2);
-                adc_tmp_1 = 0;
-                tmp_1_cnt = 0;
-            }
-            else
-            {
-                adc_tmp_1 += ((ADRESH & 0x03) << 8) + ADRESL;
-                tmp_1_cnt++;
-            }
-            
-            // Switch to RA4/AN3.
-            ADCON0bits.CHS = 0b00011;
-        }
-        else
-        {
-            if (tmp_2_cnt == TMP_MAX_SAMPLES)
-            {
-                register_map[TMP_2_REG] = (byte)((adc_tmp_2 / TMP_MAX_SAMPLES) >> 2);
-                adc_tmp_2 = 0;
-                tmp_2_cnt = 0;
-            }
-            else
-            {
-                adc_tmp_2 += ((ADRESH & 0x03) << 8) + ADRESL;
-                tmp_2_cnt++;
-            }
-            
-            // Switch to RC2/AN6.
-            ADCON0bits.CHS = 0b00110;
-        }
-        
-        PIR1bits.ADIF = 0;
+        adc_isr();
     }
+}
+
+void set_pwm(byte channel, short output)
+{
+    
+}
+
+void update_pid(byte channel)
+{
+    short error;
+    short input;
+    short d_input;
+    short output_sum;
+    short output;
+    
+    input = register_map[TMP_1_REG + channel];
+    error = setpoint - input;
+    d_input = last_input[channel] - input;
+    output_sum += ki * input;
+    if (output_sum > MAX_OUTPUT)
+    {
+        output_sum = MAX_OUTPUT;
+    }
+    
+    if (output_sum < MIN_OUTPUT)
+    {
+        output_sum = MIN_OUTPUT;
+    }
+    
+    output = kp * error;
+    output += output_sum - kd * d_input;
+    
+    if (output > MAX_OUTPUT)
+    {
+        output = MAX_OUTPUT;
+    }
+    
+    if (output < MIN_OUTPUT)
+    {
+        output = MIN_OUTPUT;
+    }
+    
+    set_pwm(channel, output);
 }
 
 void main(void)
@@ -447,6 +548,8 @@ void main(void)
 
     while(1) {
         __delay_ms(10);
+        update_pid(0);
+        update_pid(1);
         // PORTCbits.RC4 ^= 1;
     }
 }
